@@ -4,14 +4,13 @@
  * Что делает: каждое сообщение, пересланное в рабочую группу менеджеров,
  * складывает «как есть» на лист «Входящие» (текст, дата исходного поста,
  * автор, контакт, источник). ИИ здесь нет — разбор делает Claude по команде
- * «актуализируй», перенося данные на лист «ГАБы».
+ * «актуализируй», перенося объекты в рабочую таблицу (лист «МСК_Парсим»).
  *
  * Настройка — см. README.md в этой папке.
  */
 
 // ─── Названия листов ────────────────────────────────────────────────────────
 const SHEET_INBOX = 'Входящие';
-const SHEET_GAB = 'ГАБы';
 
 // Сообщения, написанные прямо в группе (не пересланные), сохраняем,
 // только если они длиннее этого порога — чтобы не тащить в таблицу болтовню.
@@ -33,24 +32,6 @@ const INBOX_HEADERS = [
   'Статус',             // M  новое / обработано / пропущено / дубль
 ];
 
-const GAB_HEADERS = [
-  'Дата публикации',     // A
-  'Дней назад',          // B  формула
-  'Арендатор',           // C
-  'МАП, ₽/мес',          // D
-  'Цена, ₽',             // E
-  'Окупаемость, лет',    // F  формула
-  'Доходность, %',       // G  формула
-  'Площадь, м²',         // H
-  'Город',               // I
-  'Локация / адрес',     // J
-  'Комментарий',         // K
-  'Контакт',             // L
-  'Источник',            // M
-  'Ссылка',              // N
-  'Статус объекта',      // O  в продаже / снят / в работе — ведёте руками
-  'ID входящего',        // P
-];
 
 // ─── Приём сообщений от Telegram ────────────────────────────────────────────
 function doPost(e) {
@@ -162,45 +143,17 @@ function describeOrigin_(msg) {
 
 // ─── Подготовка таблицы: запустить один раз вручную ─────────────────────────
 function setup() {
-  const ss = SpreadsheetApp.getActiveSpreadsheet();
-
   const inbox = getInbox_();
   styleHeader_(inbox, INBOX_HEADERS.length);
   inbox.setColumnWidth(12, 500);
   inbox.getRange('L:L').setWrap(true);
   inbox.getRange('B:C').setNumberFormat('dd.mm.yyyy hh:mm');
 
-  let gab = ss.getSheetByName(SHEET_GAB);
-  if (!gab) gab = ss.insertSheet(SHEET_GAB, 0);
-  gab.getRange(1, 1, 1, GAB_HEADERS.length).setValues([GAB_HEADERS]);
-  styleHeader_(gab, GAB_HEADERS.length);
-  gab.getRange('A:A').setNumberFormat('dd.mm.yyyy');
-  gab.getRange('D:E').setNumberFormat('# ##0 ₽');
-  gab.getRange('F:F').setNumberFormat('0.0');
-  gab.getRange('G:G').setNumberFormat('0.0"%"');
-  gab.getRange('K:K').setWrap(true);
-  gab.setColumnWidth(11, 320);
-
-  // Свежесть: зелёный до 7 дней, жёлтый до 30, красный старше
-  const days = gab.getRange('B2:B');
-  gab.setConditionalFormatRules([
-    SpreadsheetApp.newConditionalFormatRule().whenNumberLessThanOrEqualTo(7)
-      .setBackground('#d9f2e3').setRanges([days]).build(),
-    SpreadsheetApp.newConditionalFormatRule().whenNumberBetween(8, 30)
-      .setBackground('#fff3cd').setRanges([days]).build(),
-    SpreadsheetApp.newConditionalFormatRule().whenNumberGreaterThan(30)
-      .setBackground('#f8d7da').setRanges([days]).build(),
-  ]);
-
-  const status = SpreadsheetApp.newDataValidation()
-    .requireValueInList(['в продаже', 'в работе', 'снят', 'продан'], true).build();
-  gab.getRange('O2:O').setDataValidation(status);
-
   const props = PropertiesService.getScriptProperties();
   if (!props.getProperty('WEBHOOK_SECRET')) {
     props.setProperty('WEBHOOK_SECRET', Utilities.getUuid().replace(/-/g, ''));
   }
-  notify_('Готово: листы «ГАБы» и «Входящие» настроены.');
+  notify_('Готово: лист «Входящие» настроен.');
 }
 
 // ─── Связка с Telegram: запустить после «Развернуть» ────────────────────────
@@ -238,7 +191,7 @@ function checkWebhook() {
 // Пункт меню в таблице
 function onOpen() {
   SpreadsheetApp.getUi().createMenu('🤖 ГАБ бот')
-    .addItem('1. Подготовить листы', 'setup')
+    .addItem('1. Подготовить лист', 'setup')
     .addItem('2. Подключить к Telegram', 'setWebhook')
     .addItem('Проверить связь', 'checkWebhook')
     .addToUi();
