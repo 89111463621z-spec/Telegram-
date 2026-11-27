@@ -1,5 +1,7 @@
 /**
- * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 5.
+ * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 6.
+ * Сообщения забираются из Telegram каждые 5 минут (getUpdates по таймеру):
+ * вебхук Apps Script отвечает Telegram кодом 302, и тот бесконечно повторяет доставку.
  * Текст постов — на лист «Входящие». Фото/видео/PDF — в Битрикс24
  * (Общий диск → Объекты МСК → ГАБ медиа из таблицы) и служебная копия на Google Диск.
  */
@@ -27,35 +29,69 @@ function log_(text) {
   } catch (e) { console.error(e); }
 }
 
-function doPost(e) {
+// ─── Забор сообщений по таймеру ──────────────────────────────────────────────
+// Запустить ОДИН раз вручную: отключает вебхук и ставит таймер на каждые 5 минут.
+function startPolling() {
+  const token = PropertiesService.getScriptProperties().getProperty('BOT_TOKEN');
+  const r = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/deleteWebhook?drop_pending_updates=false',
+    { muteHttpExceptions: true });
+  notify_('Вебхук отключён: ' + r.getContentText());
+  ScriptApp.getProjectTriggers().forEach(function (t) {
+    if (t.getHandlerFunction() === 'poll') ScriptApp.deleteTrigger(t);
+  });
+  ScriptApp.newTrigger('poll').timeBased().everyMinutes(5).create();
+  notify_('Таймер включён: бот проверяет группу каждые 5 минут.');
+  poll();
+}
+
+function poll() {
+  const lock = LockService.getScriptLock();
+  if (!lock.tryLock(1000)) return; // предыдущий запуск ещё работает
+  const started = Date.now();
   try {
     const props = PropertiesService.getScriptProperties();
-    const secret = props.getProperty('WEBHOOK_SECRET');
-    if (secret && (!e.parameter || e.parameter.secret !== secret)) {
-      log_('Пропуск: неверный секрет');
-      return ok_();
+    const token = props.getProperty('BOT_TOKEN');
+    let offset = Number(props.getProperty('UPDATE_OFFSET') || 0);
+    const r = UrlFetchApp.fetch('https://api.telegram.org/bot' + token + '/getUpdates?timeout=0&limit=50' +
+      '&allowed_updates=' + encodeURIComponent('["message","channel_post"]') + (offset ? '&offset=' + offset : ''),
+      { muteHttpExceptions: true });
+    const body = JSON.parse(r.getContentText());
+    if (!body.ok) { log_('getUpdates: ' + body.description); return; }
+    lock.releaseLock(); // дальше блокировки берутся точечно
+    for (let i = 0; i < body.result.length; i++) {
+      if (Date.now() - started > 4 * 60 * 1000) break; // остальное — в следующий запуск
+      const u = body.result[i];
+      try { handleUpdate_(u); } catch (err) { log_('ОШИБКА: ' + (err && err.stack ? err.stack : err)); }
+      props.setProperty('UPDATE_OFFSET', String(u.update_id + 1));
     }
-
-    const update = JSON.parse(e.postData.contents);
-    const msg = update.message || update.channel_post;
-    if (!msg) { log_('Пропуск: нет сообщения, ключи: ' + Object.keys(update).join(',')); return ok_(); }
-
-    const allowed = props.getProperty('ALLOWED_CHAT_ID');
-    if (allowed && String(msg.chat.id) !== allowed) { log_('Пропуск: чужой чат ' + msg.chat.id); return ok_(); }
-    if (msg.chat.type === 'private') { log_('Пропуск: личный чат с ботом'); return ok_(); }
-
-    const text = msg.text || msg.caption || '';
-    const isForward = !!(msg.forward_origin || msg.forward_date);
-    log_('Сообщение ' + msg.message_id + ' из «' + (msg.chat.title || msg.chat.id) + '»: пересылка=' + isForward +
-         ', текст=' + text.length + ' симв., медиа=' + mediaKind_(msg));
-    const hasMedia = !!(msg.photo || msg.video || msg.document);
-    if (!isForward && !hasMedia && text.length < MIN_OWN_TEXT_LENGTH) { log_('Пропуск: короткое своё сообщение'); return ok_(); }
-
-    saveMessage_(msg, text);
-    log_('Записано: ' + msg.message_id);
-  } catch (err) {
-    log_('ОШИБКА: ' + (err && err.stack ? err.stack : err));
+  } finally {
+    try { lock.releaseLock(); } catch (e) {}
   }
+}
+
+function handleUpdate_(update) {
+  const msg = update.message || update.channel_post;
+  if (!msg) return;
+  if (msg.chat.type === 'private') { log_('Пропуск: личный чат с ботом'); return; }
+  const allowed = PropertiesService.getScriptProperties().getProperty('ALLOWED_CHAT_ID');
+  if (allowed && String(msg.chat.id) !== allowed) { log_('Пропуск: чужой чат ' + msg.chat.id); return; }
+
+  const text = msg.text || msg.caption || '';
+  const isForward = !!(msg.forward_origin || msg.forward_date);
+  const hasMedia = !!(msg.photo || msg.video || msg.document);
+  log_('Сообщение ' + msg.message_id + ' из «' + (msg.chat.title || msg.chat.id) + '»: пересылка=' + isForward +
+       ', текст=' + text.length + ' симв., медиа=' + mediaKind_(msg));
+  if (!isForward && !hasMedia && text.length < MIN_OWN_TEXT_LENGTH) { log_('Пропуск: короткое своё сообщение'); return; }
+  saveMessage_(msg, text);
+  log_('Записано: ' + msg.message_id);
+}
+
+// Старый вход через вебхук — оставлен на случай, если вебхук снова включат
+function doPost(e) {
+  const secret = PropertiesService.getScriptProperties().getProperty('WEBHOOK_SECRET');
+  if (secret && (!e.parameter || e.parameter.secret !== secret)) return ok_();
+  try { handleUpdate_(JSON.parse(e.postData.contents)); }
+  catch (err) { log_('ОШИБКА: ' + err); }
   return ok_();
 }
 
