@@ -1,5 +1,5 @@
 /**
- * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 6.
+ * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 7.
  * Сообщения забираются из Telegram каждые 5 минут (getUpdates по таймеру):
  * вебхук Apps Script отвечает Telegram кодом 302, и тот бесконечно повторяет доставку.
  * Текст постов — на лист «Входящие». Фото/видео/PDF — в Битрикс24
@@ -13,11 +13,12 @@ const MEDIA_FOLDER_NAME = 'ГАБ медиа (копия для разбора)'
 const BITRIX_PARENT_NAME = 'Объекты МСК';        // папка на Общем диске Битрикса
 const BITRIX_FOLDER_NAME = 'ГАБ медиа из таблицы'; // её создаст скрипт
 const TG_MAX_FILE = 20 * 1024 * 1024; // Telegram отдаёт ботам файлы до 20 МБ
+const GROUP_WINDOW_SEC = 120; // посты одного автора, пересланные в пределах 2 минут, — один объект
 
 const INBOX_HEADERS = [
   'ID', 'Получено', 'Дата публикации', 'Кто переслал', 'Тип источника',
   'Автор', 'Контакт автора', 'Источник', 'Ссылка на оригинал',
-  'Ссылка в нашей группе', 'Медиа', 'Текст', 'Статус', 'Альбом', 'Папка в Битриксе', 'Копия для разбора',
+  'Ссылка в нашей группе', 'Медиа', 'Текст', 'Статус', 'Объект', 'Папка в Битриксе', 'Копия для разбора',
 ];
 
 // Журнал на отдельном листе: облачные логи для запусков от Telegram не видны
@@ -101,8 +102,9 @@ function saveMessage_(msg, text) {
   if (cache.get(id)) { log_('Повтор от Telegram, пропуск ' + id); return; }
   cache.put(id, '1', 21600);
 
+  const key = objectKey_(msg);
   let links = { bitrix: '', google: '' };
-  try { links = saveMedia_(msg); }
+  try { links = saveMedia_(msg, key); }
   catch (err) { links.google = 'ошибка медиа: ' + err; log_('Медиа: ' + err); }
 
   const lock = LockService.getScriptLock();
@@ -125,7 +127,7 @@ function saveMessage_(msg, text) {
       mediaKind_(msg),
       text,
       text || links.google || links.bitrix ? 'новое' : 'без текста',
-      msg.media_group_id || '',
+      key,
       links.bitrix,
       links.google,
     ]);
@@ -135,7 +137,7 @@ function saveMessage_(msg, text) {
 }
 
 // ─── Медиа: скачать из Telegram и положить в папку объекта ──────────────────
-function saveMedia_(msg) {
+function saveMedia_(msg, key) {
   let file = null, name = '';
   if (msg.photo) { file = msg.photo[msg.photo.length - 1]; name = 'фото_' + msg.message_id + '.jpg'; }
   else if (msg.video) { file = msg.video; name = msg.video.file_name || ('видео_' + msg.message_id + '.mp4'); }
@@ -145,15 +147,19 @@ function saveMedia_(msg) {
 
   if (file.file_size && file.file_size > TG_MAX_FILE) {
     const note = 'Файл «' + name + '» больше 20 МБ — Telegram не даёт боту его скачать. Смотрите в группе.';
-    links.google = objectFolder_(msg).getUrl();
-    objectFolder_(msg).createFile('СЛИШКОМ_БОЛЬШОЙ_ФАЙЛ_' + msg.message_id + '.txt', note);
+    links.google = objectFolder_(msg, key).getUrl();
+    objectFolder_(msg, key).createFile('СЛИШКОМ_БОЛЬШОЙ_ФАЙЛ_' + msg.message_id + '.txt', note);
+    if (PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK')) {
+      try { links.bitrix = bitrixObjectFolder_(msg, key).url; } catch (err) { log_('Битрикс: ' + err); }
+    }
+    log_('Файл больше 20 МБ, не скачан: ' + name);
     return links;
   }
   const blob = downloadFromTelegram_(file.file_id).setName(name);
 
   // Служебная копия на Google Диск — чтобы Claude мог прочитать фото
   try {
-    const gFolder = objectFolder_(msg);
+    const gFolder = objectFolder_(msg, key);
     gFolder.createFile(blob);
     links.google = gFolder.getUrl();
   } catch (err) { links.google = 'ошибка Google: ' + err; log_('Google: ' + err); }
@@ -161,7 +167,7 @@ function saveMedia_(msg) {
   // Основное хранение — Битрикс24
   if (PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK')) {
     try {
-      const b = bitrixObjectFolder_(msg);
+      const b = bitrixObjectFolder_(msg, key);
       bitrix_('disk.folder.uploadfile', {
         id: b.id,
         data: { NAME: name },
@@ -205,24 +211,40 @@ function bitrix_(method, params) {
 }
 
 function folderTitle_(msg) {
-  return Utilities.formatDate(toDate_(msg.date), 'Europe/Moscow', 'yyyy-MM-dd HH-mm') + ' — ' +
-         (describeOrigin_(msg).author || 'объект');
+  const o = describeOrigin_(msg);
+  return Utilities.formatDate(toDate_(o.date || msg.date), 'Europe/Moscow', 'yyyy-MM-dd HH-mm') + ' — ' +
+         (o.author || 'объект');
+}
+
+// Ключ объекта: альбом целиком, а также всё, что один человек переслал от одного автора
+// с паузами не больше 2 минут, считается одним объектом (одна папка, одна запись в таблице)
+function objectKey_(msg) {
+  const props = PropertiesService.getScriptProperties();
+  const o = describeOrigin_(msg);
+  const who = (o.contact || o.author || o.source || '?');
+  const slot = 'LAST_' + msg.chat.id + '_' + (msg.from ? msg.from.id : 'x');
+  const last = JSON.parse(props.getProperty(slot) || 'null');
+  let key;
+  if (msg.media_group_id && last && last.g === msg.media_group_id) key = last.k;
+  else if (last && last.w === who && msg.date - last.t <= GROUP_WINDOW_SEC) key = last.k;
+  else key = msg.chat.id + '_' + msg.message_id;
+  props.setProperty(slot, JSON.stringify({ w: who, t: msg.date, k: key, g: msg.media_group_id || '' }));
+  return key;
 }
 
 // Подпапка объекта в Битриксе (одна на альбом)
-function bitrixObjectFolder_(msg) {
+function bitrixObjectFolder_(msg, key) {
   const props = PropertiesService.getScriptProperties();
-  const key = 'B_' + (msg.media_group_id || (msg.chat.id + '_' + msg.message_id));
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
-    const known = props.getProperty(key);
+    const known = props.getProperty('B_' + key);
     if (known) return JSON.parse(known);
     const root = props.getProperty('BITRIX_FOLDER_ID');
     if (!root) throw new Error('сначала запустите bitrixSetup');
     const f = bitrix_('disk.folder.addsubfolder', { id: root, data: { NAME: folderTitle_(msg) } });
     const v = { id: f.ID, url: f.DETAIL_URL };
-    props.setProperty(key, JSON.stringify(v));
+    props.setProperty('B_' + key, JSON.stringify(v));
     return v;
   } finally {
     lock.releaseLock();
@@ -250,16 +272,15 @@ function bitrixSetup() {
 }
 
 // Одна папка на объект: все фото/видео одного альбома попадают в неё
-function objectFolder_(msg) {
+function objectFolder_(msg, key) {
   const props = PropertiesService.getScriptProperties();
-  const key = 'F_' + (msg.media_group_id || (msg.chat.id + '_' + msg.message_id));
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
-    const known = props.getProperty(key);
+    const known = props.getProperty('F_' + key);
     if (known) return DriveApp.getFolderById(known);
     const folder = rootFolder_().createFolder(folderTitle_(msg));
-    props.setProperty(key, folder.getId());
+    props.setProperty('F_' + key, folder.getId());
     return folder;
   } finally {
     lock.releaseLock();
