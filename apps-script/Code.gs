@@ -1,19 +1,21 @@
 /**
- * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 3.
- * Складывает пересланные в группу сообщения на лист «Входящие»,
- * фото/видео/PDF — в папку «ГАБ медиа» на Google Диске (по папке на объект).
+ * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 4.
+ * Текст постов — на лист «Входящие». Фото/видео/PDF — в Битрикс24
+ * (Общий диск → Объекты МСК → ГАБ медиа из таблицы) и служебная копия на Google Диск.
  */
 
 const SPREADSHEET_ID = '18YCy0pkS-3mSarf9XVHmg8wcuLdW7e7JO-P0X_Z0y9Q';
 const SHEET_INBOX = 'Входящие';
 const MIN_OWN_TEXT_LENGTH = 120;
-const MEDIA_FOLDER_NAME = 'ГАБ медиа';
+const MEDIA_FOLDER_NAME = 'ГАБ медиа (копия для разбора)';
+const BITRIX_PARENT_NAME = 'Объекты МСК';        // папка на Общем диске Битрикса
+const BITRIX_FOLDER_NAME = 'ГАБ медиа из таблицы'; // её создаст скрипт
 const TG_MAX_FILE = 20 * 1024 * 1024; // Telegram отдаёт ботам файлы до 20 МБ
 
 const INBOX_HEADERS = [
   'ID', 'Получено', 'Дата публикации', 'Кто переслал', 'Тип источника',
   'Автор', 'Контакт автора', 'Источник', 'Ссылка на оригинал',
-  'Ссылка в нашей группе', 'Медиа', 'Текст', 'Статус', 'Альбом', 'Папка с медиа',
+  'Ссылка в нашей группе', 'Медиа', 'Текст', 'Статус', 'Альбом', 'Папка в Битриксе', 'Копия для разбора',
 ];
 
 function doPost(e) {
@@ -54,9 +56,9 @@ function saveMessage_(msg, text) {
   if (cache.get(id)) return;
   cache.put(id, '1', 21600);
 
-  let folderUrl = '';
-  try { folderUrl = saveMedia_(msg); }
-  catch (err) { folderUrl = 'ошибка медиа: ' + err; console.error('Медиа: ' + err); }
+  let links = { bitrix: '', google: '' };
+  try { links = saveMedia_(msg); }
+  catch (err) { links.google = 'ошибка медиа: ' + err; console.error('Медиа: ' + err); }
 
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
@@ -77,9 +79,10 @@ function saveMessage_(msg, text) {
       groupLink_(msg),
       mediaKind_(msg),
       text,
-      text || folderUrl ? 'новое' : 'без текста',
+      text || links.google || links.bitrix ? 'новое' : 'без текста',
       msg.media_group_id || '',
-      folderUrl,
+      links.bitrix,
+      links.google,
     ]);
   } finally {
     lock.releaseLock();
@@ -92,26 +95,113 @@ function saveMedia_(msg) {
   if (msg.photo) { file = msg.photo[msg.photo.length - 1]; name = 'фото_' + msg.message_id + '.jpg'; }
   else if (msg.video) { file = msg.video; name = msg.video.file_name || ('видео_' + msg.message_id + '.mp4'); }
   else if (msg.document) { file = msg.document; name = msg.document.file_name || ('файл_' + msg.message_id); }
-  if (!file) return '';
+  const links = { bitrix: '', google: '' };
+  if (!file) return links;
 
-  const folder = objectFolder_(msg);
   if (file.file_size && file.file_size > TG_MAX_FILE) {
-    folder.createFile('СЛИШКОМ_БОЛЬШОЙ_ФАЙЛ_' + msg.message_id + '.txt',
-      'Файл «' + name + '» больше 20 МБ — Telegram не даёт боту его скачать. Смотрите в группе.');
-    return folder.getUrl();
+    const note = 'Файл «' + name + '» больше 20 МБ — Telegram не даёт боту его скачать. Смотрите в группе.';
+    links.google = objectFolder_(msg).getUrl();
+    objectFolder_(msg).createFile('СЛИШКОМ_БОЛЬШОЙ_ФАЙЛ_' + msg.message_id + '.txt', note);
+    return links;
   }
+  const blob = downloadFromTelegram_(file.file_id).setName(name);
+
+  // Служебная копия на Google Диск — чтобы Claude мог прочитать фото
+  try {
+    const gFolder = objectFolder_(msg);
+    gFolder.createFile(blob);
+    links.google = gFolder.getUrl();
+  } catch (err) { links.google = 'ошибка Google: ' + err; console.error('Google: ' + err); }
+
+  // Основное хранение — Битрикс24
+  if (PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK')) {
+    try {
+      const b = bitrixObjectFolder_(msg);
+      bitrix_('disk.folder.uploadfile', {
+        id: b.id,
+        data: { NAME: name },
+        fileContent: [name, Utilities.base64Encode(blob.getBytes())],
+        generateUniqueName: true,
+      });
+      links.bitrix = b.url;
+    } catch (err) { links.bitrix = 'ошибка Битрикс: ' + err; console.error('Битрикс: ' + err); }
+  }
+  return links;
+}
+
+function downloadFromTelegram_(fileId) {
   const token = PropertiesService.getScriptProperties().getProperty('BOT_TOKEN');
   // muteHttpExceptions: чтобы токен из адреса не попал в текст ошибки
   const r1 = UrlFetchApp.fetch('https://api.telegram.org/bot' + token +
-    '/getFile?file_id=' + encodeURIComponent(file.file_id), { muteHttpExceptions: true });
+    '/getFile?file_id=' + encodeURIComponent(fileId), { muteHttpExceptions: true });
   const info = JSON.parse(r1.getContentText());
   if (!info.ok) throw new Error('getFile: ' + (info.description || r1.getResponseCode()));
   const r2 = UrlFetchApp.fetch('https://api.telegram.org/file/bot' + token + '/' + info.result.file_path,
     { muteHttpExceptions: true });
   if (r2.getResponseCode() !== 200) throw new Error('скачивание: код ' + r2.getResponseCode());
-  const blob = r2.getBlob().setName(name);
-  folder.createFile(blob);
-  return folder.getUrl();
+  return r2.getBlob();
+}
+
+// ─── Битрикс24 ──────────────────────────────────────────────────────────────
+function bitrix_(method, params) {
+  const hook = PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK').replace(/\/?$/, '/');
+  let res;
+  try {
+    res = UrlFetchApp.fetch(hook + method + '.json', {
+      method: 'post', contentType: 'application/json',
+      payload: JSON.stringify(params || {}), muteHttpExceptions: true,
+    });
+  } catch (err) {
+    throw new Error(method + ': нет связи с Битриксом'); // без адреса вебхука в тексте
+  }
+  const body = JSON.parse(res.getContentText() || '{}');
+  if (body.error) throw new Error(method + ': ' + body.error + ' ' + (body.error_description || ''));
+  return body.result;
+}
+
+function folderTitle_(msg) {
+  return Utilities.formatDate(toDate_(msg.date), 'Europe/Moscow', 'yyyy-MM-dd HH-mm') + ' — ' +
+         (describeOrigin_(msg).author || 'объект');
+}
+
+// Подпапка объекта в Битриксе (одна на альбом)
+function bitrixObjectFolder_(msg) {
+  const props = PropertiesService.getScriptProperties();
+  const key = 'B_' + (msg.media_group_id || (msg.chat.id + '_' + msg.message_id));
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const known = props.getProperty(key);
+    if (known) return JSON.parse(known);
+    const root = props.getProperty('BITRIX_FOLDER_ID');
+    if (!root) throw new Error('сначала запустите bitrixSetup');
+    const f = bitrix_('disk.folder.addsubfolder', { id: root, data: { NAME: folderTitle_(msg) } });
+    const v = { id: f.ID, url: f.DETAIL_URL };
+    props.setProperty(key, JSON.stringify(v));
+    return v;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+// Запустить один раз: находит «Объекты МСК» на Общем диске и создаёт там папку
+function bitrixSetup() {
+  const props = PropertiesService.getScriptProperties();
+  const storages = bitrix_('disk.storage.getlist', { filter: { ENTITY_TYPE: 'common' } });
+  if (!storages || !storages.length) throw new Error('Общий диск не найден');
+  const storage = storages[0];
+  const top = bitrix_('disk.storage.getchildren', { id: storage.ID }) || [];
+  const parent = top.filter(function (x) { return x.TYPE === 'folder' && x.NAME.trim() === BITRIX_PARENT_NAME; })[0];
+  if (!parent) {
+    notify_('Папка «' + BITRIX_PARENT_NAME + '» не найдена в корне «' + storage.NAME + '». Есть такие: ' +
+            top.filter(function (x) { return x.TYPE === 'folder'; }).map(function (x) { return x.NAME; }).join(' | '));
+    return;
+  }
+  const inside = bitrix_('disk.folder.getchildren', { id: parent.ID }) || [];
+  let target = inside.filter(function (x) { return x.TYPE === 'folder' && x.NAME === BITRIX_FOLDER_NAME; })[0];
+  if (!target) target = bitrix_('disk.folder.addsubfolder', { id: parent.ID, data: { NAME: BITRIX_FOLDER_NAME } });
+  props.setProperty('BITRIX_FOLDER_ID', String(target.ID));
+  notify_('Готово: папка «' + BITRIX_FOLDER_NAME + '» → ' + target.DETAIL_URL);
 }
 
 // Одна папка на объект: все фото/видео одного альбома попадают в неё
@@ -123,10 +213,7 @@ function objectFolder_(msg) {
   try {
     const known = props.getProperty(key);
     if (known) return DriveApp.getFolderById(known);
-    const d = toDate_(msg.date);
-    const title = Utilities.formatDate(d, 'Europe/Moscow', 'yyyy-MM-dd HH-mm') + ' — ' +
-                  (describeOrigin_(msg).author || 'объект');
-    const folder = rootFolder_().createFolder(title);
+    const folder = rootFolder_().createFolder(folderTitle_(msg));
     props.setProperty(key, folder.getId());
     return folder;
   } finally {
@@ -232,7 +319,7 @@ function checkWebhook() {
 // Проверка записи без Telegram: добавляет тестовую строку
 function testWrite() {
   getInbox_().appendRow(['test:' + Date.now(), new Date(), new Date(), 'тест', 'своё', '', '', '', '', '', '—',
-                         'Тестовая строка — можно удалить', 'пропущено', '', '']);
+                         'Тестовая строка — можно удалить', 'пропущено', '', '', '']);
   notify_('Тестовая строка добавлена на лист «Входящие».');
 }
 
