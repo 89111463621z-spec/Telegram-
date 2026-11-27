@@ -1,5 +1,5 @@
 /**
- * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 4.
+ * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 5.
  * Текст постов — на лист «Входящие». Фото/видео/PDF — в Битрикс24
  * (Общий диск → Объекты МСК → ГАБ медиа из таблицы) и служебная копия на Google Диск.
  */
@@ -18,34 +18,43 @@ const INBOX_HEADERS = [
   'Ссылка в нашей группе', 'Медиа', 'Текст', 'Статус', 'Альбом', 'Папка в Битриксе', 'Копия для разбора',
 ];
 
+// Журнал на отдельном листе: облачные логи для запусков от Telegram не видны
+function log_(text) {
+  try {
+    const ss = SpreadsheetApp.openById(SPREADSHEET_ID);
+    const sh = ss.getSheetByName('Журнал') || ss.insertSheet('Журнал');
+    sh.appendRow([new Date(), String(text).slice(0, 500)]);
+  } catch (e) { console.error(e); }
+}
+
 function doPost(e) {
   try {
     const props = PropertiesService.getScriptProperties();
     const secret = props.getProperty('WEBHOOK_SECRET');
     if (secret && (!e.parameter || e.parameter.secret !== secret)) {
-      console.warn('Пропуск: неверный секрет');
+      log_('Пропуск: неверный секрет');
       return ok_();
     }
 
     const update = JSON.parse(e.postData.contents);
     const msg = update.message || update.channel_post;
-    if (!msg) { console.log('Пропуск: нет сообщения, ключи: ' + Object.keys(update).join(',')); return ok_(); }
+    if (!msg) { log_('Пропуск: нет сообщения, ключи: ' + Object.keys(update).join(',')); return ok_(); }
 
     const allowed = props.getProperty('ALLOWED_CHAT_ID');
-    if (allowed && String(msg.chat.id) !== allowed) { console.log('Пропуск: чужой чат ' + msg.chat.id); return ok_(); }
-    if (msg.chat.type === 'private') { console.log('Пропуск: личный чат'); return ok_(); }
+    if (allowed && String(msg.chat.id) !== allowed) { log_('Пропуск: чужой чат ' + msg.chat.id); return ok_(); }
+    if (msg.chat.type === 'private') { log_('Пропуск: личный чат с ботом'); return ok_(); }
 
     const text = msg.text || msg.caption || '';
     const isForward = !!(msg.forward_origin || msg.forward_date);
-    console.log('Сообщение: чат=' + msg.chat.id + ' пересылка=' + isForward +
-                ' длина текста=' + text.length + ' фото=' + !!msg.photo);
+    log_('Сообщение ' + msg.message_id + ' из «' + (msg.chat.title || msg.chat.id) + '»: пересылка=' + isForward +
+         ', текст=' + text.length + ' симв., медиа=' + mediaKind_(msg));
     const hasMedia = !!(msg.photo || msg.video || msg.document);
-    if (!isForward && !hasMedia && text.length < MIN_OWN_TEXT_LENGTH) { console.log('Пропуск: короткое своё сообщение'); return ok_(); }
+    if (!isForward && !hasMedia && text.length < MIN_OWN_TEXT_LENGTH) { log_('Пропуск: короткое своё сообщение'); return ok_(); }
 
     saveMessage_(msg, text);
-    console.log('Записано');
+    log_('Записано: ' + msg.message_id);
   } catch (err) {
-    console.error('Ошибка: ' + (err && err.stack ? err.stack : err));
+    log_('ОШИБКА: ' + (err && err.stack ? err.stack : err));
   }
   return ok_();
 }
@@ -53,18 +62,18 @@ function doPost(e) {
 function saveMessage_(msg, text) {
   const id = msg.chat.id + ':' + msg.message_id;
   const cache = CacheService.getScriptCache();
-  if (cache.get(id)) return;
+  if (cache.get(id)) { log_('Повтор от Telegram, пропуск ' + id); return; }
   cache.put(id, '1', 21600);
 
   let links = { bitrix: '', google: '' };
   try { links = saveMedia_(msg); }
-  catch (err) { links.google = 'ошибка медиа: ' + err; console.error('Медиа: ' + err); }
+  catch (err) { links.google = 'ошибка медиа: ' + err; log_('Медиа: ' + err); }
 
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
     const sheet = getInbox_();
-    if (alreadySaved_(sheet, id)) return;
+    if (alreadySaved_(sheet, id)) { log_('Уже есть в таблице: ' + id); return; }
     const o = describeOrigin_(msg);
     sheet.appendRow([
       id,
@@ -111,7 +120,7 @@ function saveMedia_(msg) {
     const gFolder = objectFolder_(msg);
     gFolder.createFile(blob);
     links.google = gFolder.getUrl();
-  } catch (err) { links.google = 'ошибка Google: ' + err; console.error('Google: ' + err); }
+  } catch (err) { links.google = 'ошибка Google: ' + err; log_('Google: ' + err); }
 
   // Основное хранение — Битрикс24
   if (PropertiesService.getScriptProperties().getProperty('BITRIX_WEBHOOK')) {
@@ -124,7 +133,7 @@ function saveMedia_(msg) {
         generateUniqueName: true,
       });
       links.bitrix = b.url;
-    } catch (err) { links.bitrix = 'ошибка Битрикс: ' + err; console.error('Битрикс: ' + err); }
+    } catch (err) { links.bitrix = 'ошибка Битрикс: ' + err; log_('Битрикс: ' + err); }
   }
   return links;
 }
