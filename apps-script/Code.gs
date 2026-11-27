@@ -1,16 +1,19 @@
 /**
- * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 2.
- * Складывает пересланные в группу сообщения на лист «Входящие».
+ * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 3.
+ * Складывает пересланные в группу сообщения на лист «Входящие»,
+ * фото/видео/PDF — в папку «ГАБ медиа» на Google Диске (по папке на объект).
  */
 
 const SPREADSHEET_ID = '18YCy0pkS-3mSarf9XVHmg8wcuLdW7e7JO-P0X_Z0y9Q';
 const SHEET_INBOX = 'Входящие';
 const MIN_OWN_TEXT_LENGTH = 120;
+const MEDIA_FOLDER_NAME = 'ГАБ медиа';
+const TG_MAX_FILE = 20 * 1024 * 1024; // Telegram отдаёт ботам файлы до 20 МБ
 
 const INBOX_HEADERS = [
   'ID', 'Получено', 'Дата публикации', 'Кто переслал', 'Тип источника',
   'Автор', 'Контакт автора', 'Источник', 'Ссылка на оригинал',
-  'Ссылка в нашей группе', 'Медиа', 'Текст', 'Статус',
+  'Ссылка в нашей группе', 'Медиа', 'Текст', 'Статус', 'Альбом', 'Папка с медиа',
 ];
 
 function doPost(e) {
@@ -34,7 +37,8 @@ function doPost(e) {
     const isForward = !!(msg.forward_origin || msg.forward_date);
     console.log('Сообщение: чат=' + msg.chat.id + ' пересылка=' + isForward +
                 ' длина текста=' + text.length + ' фото=' + !!msg.photo);
-    if (!isForward && text.length < MIN_OWN_TEXT_LENGTH) { console.log('Пропуск: короткое своё сообщение'); return ok_(); }
+    const hasMedia = !!(msg.photo || msg.video || msg.document);
+    if (!isForward && !hasMedia && text.length < MIN_OWN_TEXT_LENGTH) { console.log('Пропуск: короткое своё сообщение'); return ok_(); }
 
     saveMessage_(msg, text);
     console.log('Записано');
@@ -46,15 +50,19 @@ function doPost(e) {
 
 function saveMessage_(msg, text) {
   const id = msg.chat.id + ':' + msg.message_id;
+  const cache = CacheService.getScriptCache();
+  if (cache.get(id)) return;
+  cache.put(id, '1', 21600);
+
+  let folderUrl = '';
+  try { folderUrl = saveMedia_(msg); }
+  catch (err) { folderUrl = 'ошибка медиа: ' + err; console.error('Медиа: ' + err); }
 
   const lock = LockService.getScriptLock();
   lock.waitLock(20000);
   try {
-    const cache = CacheService.getScriptCache();
-    if (cache.get(id)) return;
     const sheet = getInbox_();
-    if (alreadySaved_(sheet, id)) { cache.put(id, '1', 21600); return; }
-
+    if (alreadySaved_(sheet, id)) return;
     const o = describeOrigin_(msg);
     sheet.appendRow([
       id,
@@ -69,12 +77,71 @@ function saveMessage_(msg, text) {
       groupLink_(msg),
       mediaKind_(msg),
       text,
-      text ? 'новое' : 'без текста',
+      text || folderUrl ? 'новое' : 'без текста',
+      msg.media_group_id || '',
+      folderUrl,
     ]);
-    cache.put(id, '1', 21600);
   } finally {
     lock.releaseLock();
   }
+}
+
+// ─── Медиа: скачать из Telegram и положить в папку объекта ──────────────────
+function saveMedia_(msg) {
+  let file = null, name = '';
+  if (msg.photo) { file = msg.photo[msg.photo.length - 1]; name = 'фото_' + msg.message_id + '.jpg'; }
+  else if (msg.video) { file = msg.video; name = msg.video.file_name || ('видео_' + msg.message_id + '.mp4'); }
+  else if (msg.document) { file = msg.document; name = msg.document.file_name || ('файл_' + msg.message_id); }
+  if (!file) return '';
+
+  const folder = objectFolder_(msg);
+  if (file.file_size && file.file_size > TG_MAX_FILE) {
+    folder.createFile('СЛИШКОМ_БОЛЬШОЙ_ФАЙЛ_' + msg.message_id + '.txt',
+      'Файл «' + name + '» больше 20 МБ — Telegram не даёт боту его скачать. Смотрите в группе.');
+    return folder.getUrl();
+  }
+  const token = PropertiesService.getScriptProperties().getProperty('BOT_TOKEN');
+  // muteHttpExceptions: чтобы токен из адреса не попал в текст ошибки
+  const r1 = UrlFetchApp.fetch('https://api.telegram.org/bot' + token +
+    '/getFile?file_id=' + encodeURIComponent(file.file_id), { muteHttpExceptions: true });
+  const info = JSON.parse(r1.getContentText());
+  if (!info.ok) throw new Error('getFile: ' + (info.description || r1.getResponseCode()));
+  const r2 = UrlFetchApp.fetch('https://api.telegram.org/file/bot' + token + '/' + info.result.file_path,
+    { muteHttpExceptions: true });
+  if (r2.getResponseCode() !== 200) throw new Error('скачивание: код ' + r2.getResponseCode());
+  const blob = r2.getBlob().setName(name);
+  folder.createFile(blob);
+  return folder.getUrl();
+}
+
+// Одна папка на объект: все фото/видео одного альбома попадают в неё
+function objectFolder_(msg) {
+  const props = PropertiesService.getScriptProperties();
+  const key = 'F_' + (msg.media_group_id || (msg.chat.id + '_' + msg.message_id));
+  const lock = LockService.getScriptLock();
+  lock.waitLock(20000);
+  try {
+    const known = props.getProperty(key);
+    if (known) return DriveApp.getFolderById(known);
+    const d = toDate_(msg.date);
+    const title = Utilities.formatDate(d, 'Europe/Moscow', 'yyyy-MM-dd HH-mm') + ' — ' +
+                  (describeOrigin_(msg).author || 'объект');
+    const folder = rootFolder_().createFolder(title);
+    props.setProperty(key, folder.getId());
+    return folder;
+  } finally {
+    lock.releaseLock();
+  }
+}
+
+function rootFolder_() {
+  const props = PropertiesService.getScriptProperties();
+  const id = props.getProperty('MEDIA_FOLDER_ID');
+  if (id) return DriveApp.getFolderById(id);
+  const folder = DriveApp.createFolder(MEDIA_FOLDER_NAME);
+  folder.setSharing(DriveApp.Access.ANYONE_WITH_LINK, DriveApp.Permission.VIEW);
+  props.setProperty('MEDIA_FOLDER_ID', folder.getId());
+  return folder;
 }
 
 function describeOrigin_(msg) {
@@ -120,7 +187,9 @@ function describeOrigin_(msg) {
 
 function setup() {
   const inbox = getInbox_();
+  inbox.getRange(1, 1, 1, INBOX_HEADERS.length).setValues([INBOX_HEADERS]);
   styleHeader_(inbox, INBOX_HEADERS.length);
+  rootFolder_();
   inbox.setColumnWidth(12, 500);
   inbox.getRange('L:L').setWrap(true);
   inbox.getRange('B:C').setNumberFormat('dd.mm.yyyy hh:mm');
@@ -129,7 +198,7 @@ function setup() {
   if (!props.getProperty('WEBHOOK_SECRET')) {
     props.setProperty('WEBHOOK_SECRET', Utilities.getUuid().replace(/-/g, ''));
   }
-  notify_('Готово: лист «Входящие» настроен.');
+  notify_('Готово: лист «Входящие» и папка «' + MEDIA_FOLDER_NAME + '» настроены.');
 }
 
 function setWebhook() {
@@ -163,7 +232,7 @@ function checkWebhook() {
 // Проверка записи без Telegram: добавляет тестовую строку
 function testWrite() {
   getInbox_().appendRow(['test:' + Date.now(), new Date(), new Date(), 'тест', 'своё', '', '', '', '', '', '—',
-                         'Тестовая строка — можно удалить', 'пропущено']);
+                         'Тестовая строка — можно удалить', 'пропущено', '', '']);
   notify_('Тестовая строка добавлена на лист «Входящие».');
 }
 
