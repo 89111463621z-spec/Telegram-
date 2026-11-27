@@ -1,5 +1,5 @@
 /**
- * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 7.
+ * ГАБ Сборщик — бот-«почтальон» для Google Таблицы. Версия 8.
  * Сообщения забираются из Telegram каждые 5 минут (getUpdates по таймеру):
  * вебхук Apps Script отвечает Telegram кодом 302, и тот бесконечно повторяет доставку.
  * Текст постов — на лист «Входящие». Фото/видео/PDF — в Битрикс24
@@ -216,19 +216,26 @@ function folderTitle_(msg) {
          (o.author || 'объект');
 }
 
-// Ключ объекта: альбом целиком, а также всё, что один человек переслал от одного автора
-// с паузами не больше 2 минут, считается одним объектом (одна папка, одна запись в таблице)
+// Ключ объекта (одна папка и одна группа строк в таблице):
+// — альбом целиком;
+// — фото/видео без текста от того же автора в пределах 2 минут — к предыдущему объекту;
+// — текст присоединяется к предыдущему объекту, только если у того ещё нет текста;
+// — PDF/документ всегда отдельный объект (обычно это отдельная презентация).
 function objectKey_(msg) {
   const props = PropertiesService.getScriptProperties();
   const o = describeOrigin_(msg);
   const who = (o.contact || o.author || o.source || '?');
   const slot = 'LAST_' + msg.chat.id + '_' + (msg.from ? msg.from.id : 'x');
   const last = JSON.parse(props.getProperty(slot) || 'null');
-  let key;
-  if (msg.media_group_id && last && last.g === msg.media_group_id) key = last.k;
-  else if (last && last.w === who && msg.date - last.t <= GROUP_WINDOW_SEC) key = last.k;
+  const hasText = (msg.text || msg.caption || '').length >= 50;
+  const near = last && last.w === who && msg.date - last.t <= GROUP_WINDOW_SEC;
+  let key, objHasText = hasText;
+  if (msg.document) key = msg.chat.id + '_' + msg.message_id;
+  else if (msg.media_group_id && last && last.g === msg.media_group_id) { key = last.k; objHasText = last.x || hasText; }
+  else if (near && !last.d && !(hasText && last.x)) { key = last.k; objHasText = last.x || hasText; }
   else key = msg.chat.id + '_' + msg.message_id;
-  props.setProperty(slot, JSON.stringify({ w: who, t: msg.date, k: key, g: msg.media_group_id || '' }));
+  props.setProperty(slot, JSON.stringify({ w: who, t: msg.date, k: key, g: msg.media_group_id || '',
+                                           x: objHasText, d: !!msg.document }));
   return key;
 }
 
@@ -242,7 +249,12 @@ function bitrixObjectFolder_(msg, key) {
     if (known) return JSON.parse(known);
     const root = props.getProperty('BITRIX_FOLDER_ID');
     if (!root) throw new Error('сначала запустите bitrixSetup');
-    const f = bitrix_('disk.folder.addsubfolder', { id: root, data: { NAME: folderTitle_(msg) } });
+    let f;
+    try { f = bitrix_('disk.folder.addsubfolder', { id: root, data: { NAME: folderTitle_(msg) } }); }
+    catch (err) {
+      if (String(err).indexOf('DISK_OBJ_22000') < 0) throw err; // папка с таким именем уже есть
+      f = bitrix_('disk.folder.addsubfolder', { id: root, data: { NAME: folderTitle_(msg) + ' #' + msg.message_id } });
+    }
     const v = { id: f.ID, url: f.DETAIL_URL };
     props.setProperty('B_' + key, JSON.stringify(v));
     return v;
