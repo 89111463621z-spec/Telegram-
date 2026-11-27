@@ -190,7 +190,7 @@ function checkWebhook() {
 
 // Пункт меню в таблице
 function onOpen() {
-  SpreadsheetApp.getUi().createMenu('🤖 ГАБ бот')
+  SpreadsheetApp.getUi().createMenu('ГАБ бот')
     .addItem('1. Подготовить лист', 'setup')
     .addItem('2. Подключить к Telegram', 'setWebhook')
     .addItem('Проверить связь', 'checkWebhook')
